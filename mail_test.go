@@ -504,3 +504,70 @@ func TestMail_ToBytes_SubjectHeaderInjection(t *testing.T) {
 		t.Errorf("subject header injection not prevented: %s", msg)
 	}
 }
+
+func TestMail_ToBytes_AttachmentFileName(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"report.pdf", `filename="report.pdf"`},
+		{"/var/reports/report.pdf", `filename="report.pdf"`},
+		{`say "hi".txt`, `filename="say \"hi\".txt"`},
+		{"Отчёт.pdf", `filename="=?utf-8?b?` + base64.StdEncoding.EncodeToString([]byte("Отчёт.pdf")) + `?="`},
+	}
+
+	for _, tt := range tests {
+		mail := Mail{
+			MT:         PlainText,
+			From:       "sender@example.com",
+			To:         []string{"recipient@example.com"},
+			Subject:    "Attachment name",
+			Body:       "See attached.",
+			Attachment: []AttachmentFile{{Name: tt.name, Body: []byte("data")}},
+		}
+
+		msg, err := mail.ToBytes()
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", tt.name, err)
+		}
+		if !bytes.Contains(msg, []byte(tt.want)) {
+			t.Errorf("%q: expected %s, got: %s", tt.name, tt.want, msg)
+		}
+	}
+}
+
+func TestMail_ToBytes_AttachmentFileNameRoundTrip(t *testing.T) {
+	name := strings.Repeat("Длинное имя файла ", 5) + ".xlsx"
+	mail := Mail{
+		MT:         PlainText,
+		From:       "sender@example.com",
+		To:         []string{"recipient@example.com"},
+		Subject:    "Attachment name",
+		Body:       "See attached.",
+		Attachment: []AttachmentFile{{Name: name, Body: []byte("data")}},
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// unfold headers and parse the attachment's Content-Disposition
+	unfolded := strings.ReplaceAll(string(msg), "\r\n ", " ")
+	_, rest, ok := strings.Cut(unfolded, "Content-Disposition: ")
+	if !ok {
+		t.Fatalf("no Content-Disposition in: %s", msg)
+	}
+	value, _, _ := strings.Cut(rest, "\r\n")
+	_, params, err := mime.ParseMediaType(value)
+	if err != nil {
+		t.Fatalf("parse %q: %v", value, err)
+	}
+	got, err := new(mime.WordDecoder).DecodeHeader(params["filename"])
+	if err != nil {
+		t.Fatalf("decode filename: %v", err)
+	}
+	if got != name {
+		t.Errorf("filename round-trip mismatch:\n got %q\nwant %q", got, name)
+	}
+}

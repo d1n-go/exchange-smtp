@@ -9,6 +9,7 @@ import (
 	"mime"
 	"mime/quotedprintable"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -97,6 +98,21 @@ func writeHeader(msg *bytes.Buffer, name, value string) {
 	msg.WriteString("\r\n")
 }
 
+// sanitize strips CR and LF to prevent header injection.
+var sanitize = strings.NewReplacer("\r", "", "\n", "").Replace
+
+// encodeFileName prepares a file name for a quoted name/filename parameter:
+// drops the directory part, RFC 2047-encodes non-ASCII names (the form
+// Outlook and Exchange themselves produce) and escapes quotes.
+func encodeFileName(name string) string {
+	name = sanitize(name)
+	if name != "" {
+		name = filepath.Base(name)
+	}
+	name = mime.BEncoding.Encode("utf-8", name)
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(name)
+}
+
 // generateBoundary creates a random MIME boundary
 func generateBoundary() string {
 	var buf [16]byte
@@ -176,18 +192,17 @@ func (m *Mail) ToBytes() ([]byte, error) {
 		for _, file := range m.Inline {
 			msg.WriteString(fmt.Sprintf("\r\n--%s\r\n", relatedBoundary))
 
-			sanitize := strings.NewReplacer("\r", "", "\n", "").Replace
 			contentType := sanitize(file.ContentType)
 			if contentType == "" {
 				contentType = "application/octet-stream"
 			}
-			name := sanitize(file.Name)
+			name := encodeFileName(file.Name)
 			cid := sanitize(file.CID)
 
-			msg.WriteString(fmt.Sprintf("Content-Type: %s; name=\"%s\"\r\n", contentType, name))
-			msg.WriteString("Content-Transfer-Encoding: base64\r\n")
-			msg.WriteString(fmt.Sprintf("Content-ID: <%s>\r\n", cid))
-			msg.WriteString(fmt.Sprintf("Content-Disposition: inline; filename=\"%s\"\r\n", name))
+			writeHeader(msg, "Content-Type", fmt.Sprintf("%s; name=\"%s\"", contentType, name))
+			writeHeader(msg, "Content-Transfer-Encoding", "base64")
+			writeHeader(msg, "Content-ID", "<"+cid+">")
+			writeHeader(msg, "Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", name))
 
 			if err := m.writeBytes(msg, file.Body); err != nil {
 				return nil, err
@@ -212,7 +227,6 @@ func (m *Mail) ToBytes() ([]byte, error) {
 
 	// add attachments
 	if hasAttachments {
-		sanitize := strings.NewReplacer("\r", "", "\n", "").Replace
 		for _, file := range m.Attachment {
 			msg.WriteString(fmt.Sprintf("\r\n--%s\r\n", boundary))
 
@@ -220,10 +234,10 @@ func (m *Mail) ToBytes() ([]byte, error) {
 			if contentType == "" {
 				contentType = "application/octet-stream"
 			}
-			name := sanitize(file.Name)
-			msg.WriteString(fmt.Sprintf("Content-Type: %s; name=\"%s\"\r\n", contentType, name))
-			msg.WriteString("Content-Transfer-Encoding: base64\r\n")
-			msg.WriteString(fmt.Sprintf("Content-Disposition: attachment; filename=\"%s\"\r\n", name))
+			name := encodeFileName(file.Name)
+			writeHeader(msg, "Content-Type", fmt.Sprintf("%s; name=\"%s\"", contentType, name))
+			writeHeader(msg, "Content-Transfer-Encoding", "base64")
+			writeHeader(msg, "Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
 
 			if len(file.Body) > 0 {
 				if err := m.writeBytes(msg, file.Body); err != nil {
