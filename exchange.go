@@ -99,7 +99,7 @@ func NewMailSender(username, password, server string, opts ...Option) *MailSende
 	return ms
 }
 
-// Send sends the email to all To and Cc recipients.
+// Send sends the email to all To, Cc and Bcc recipients.
 func (ms *MailSender) Send(mail Mail) error {
 	return ms.SendContext(context.Background(), mail)
 }
@@ -111,7 +111,7 @@ func (ms *MailSender) SendContext(ctx context.Context, mail Mail) error {
 		return err
 	}
 
-	err = ms.send(ctx, mail.From, mail.AllRecipients(), b)
+	err = ms.send(ctx, bareAddress(mail.From), mail.AllRecipients(), b)
 	if err != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
