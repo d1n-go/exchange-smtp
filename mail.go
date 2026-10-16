@@ -6,11 +6,16 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"mime"
 	"mime/quotedprintable"
+	"net/mail"
+	"net/textproto"
 	"os"
-	"regexp"
+	"path/filepath"
+	"slices"
 	"strings"
+	"time"
 )
 
 type MailType int
@@ -31,25 +36,37 @@ func (mt MailType) String() string {
 
 const charset = "UTF-8"
 
-var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
-
-// ValidateEmail email-address is valid
+// ValidateEmail reports whether email is a bare RFC 5322 address
+// ("user@example.com", without a display name).
+// Single-label domains ("admin@exchange") common in internal AD networks
+// are accepted.
 func ValidateEmail(email string) bool {
-	return emailRegex.MatchString(email)
+	a, err := mail.ParseAddress(email)
+	return err == nil && a.Address == email
 }
 
 // Mail is a struct for two types of email: plain text and html like.
+//
+// Addresses may be bare ("user@example.com") or include a display name
+// ("Иван Петров <ivan@example.com>").
 type Mail struct {
 	MT MailType
 
 	From    string
 	To      []string
 	Cc      []string
+	Bcc     []string // receive the message but are not listed in headers
+	ReplyTo string
 	Subject string
 	Body    string
 
+	// Headers are extra headers, e.g. {"Importance": "High"}.
+	// Date and Message-ID may be overridden; address, subject and MIME
+	// headers are set from Mail fields and can't be.
+	Headers map[string]string
+
 	Attachment []AttachmentFile
-	Inline     []InlineFile // для inline-картинок
+	Inline     []InlineFile // inline images referenced from HTML via cid:
 }
 
 type AttachmentFile struct {
@@ -65,11 +82,99 @@ type InlineFile struct {
 	Body        []byte
 }
 
+// AllRecipients returns the bare addresses of all To, Cc and Bcc recipients,
+// as used in the SMTP envelope.
 func (m *Mail) AllRecipients() []string {
-	r := make([]string, 0, len(m.To)+len(m.Cc))
-	r = append(r, m.To...)
-	r = append(r, m.Cc...)
+	r := make([]string, 0, len(m.To)+len(m.Cc)+len(m.Bcc))
+	for _, list := range [][]string{m.To, m.Cc, m.Bcc} {
+		for _, addr := range list {
+			r = append(r, bareAddress(addr))
+		}
+	}
 	return r
+}
+
+// bareAddress strips the display name; invalid input is returned unchanged.
+func bareAddress(addr string) string {
+	if a, err := mail.ParseAddress(addr); err == nil {
+		return a.Address
+	}
+	return addr
+}
+
+// parseAddressList parses addresses and formats them for a header.
+func parseAddressList(field string, list []string) (string, error) {
+	formatted := make([]string, 0, len(list))
+	for _, addr := range list {
+		a, err := mail.ParseAddress(addr)
+		if err != nil {
+			return "", fmt.Errorf("invalid %s email address: %s", field, addr)
+		}
+		if a.Name == "" {
+			formatted = append(formatted, a.Address)
+		} else {
+			formatted = append(formatted, a.String())
+		}
+	}
+	return strings.Join(formatted, ", "), nil
+}
+
+// reservedHeaders are set from Mail fields and can't be overridden by Headers.
+var reservedHeaders = map[string]bool{
+	"From": true, "To": true, "Cc": true, "Bcc": true, "Reply-To": true,
+	"Subject": true, "Mime-Version": true,
+	"Content-Type": true, "Content-Transfer-Encoding": true,
+}
+
+// generateMessageID creates a unique Message-ID in the sender's domain.
+func generateMessageID(from string) string {
+	domain := "localhost"
+	if _, d, ok := strings.Cut(bareAddress(from), "@"); ok && d != "" {
+		domain = d
+	}
+	var buf [16]byte
+	rand.Read(buf[:])
+	return fmt.Sprintf("<%x@%s>", buf[:], domain)
+}
+
+// maxLineLen is the recommended header line length (RFC 5322 2.1.1).
+const maxLineLen = 78
+
+// writeHeader writes "Name: value" and folds value at spaces so that lines
+// stay within maxLineLen where possible. Exchange truncates or rejects header
+// lines longer than 998 characters, which a long encoded subject easily hits.
+func writeHeader(msg *bytes.Buffer, name, value string) {
+	msg.WriteString(name)
+	msg.WriteString(": ")
+	lineLen := len(name) + 2
+	for i, word := range strings.Split(value, " ") {
+		if i > 0 {
+			if lineLen+1+len(word) > maxLineLen {
+				msg.WriteString("\r\n")
+				lineLen = 0
+			}
+			msg.WriteByte(' ')
+			lineLen++
+		}
+		msg.WriteString(word)
+		lineLen += len(word)
+	}
+	msg.WriteString("\r\n")
+}
+
+// sanitize strips CR and LF to prevent header injection.
+var sanitize = strings.NewReplacer("\r", "", "\n", "").Replace
+
+// encodeFileName prepares a file name for a quoted name/filename parameter:
+// drops the directory part, RFC 2047-encodes non-ASCII names (the form
+// Outlook and Exchange themselves produce) and escapes quotes.
+func encodeFileName(name string) string {
+	name = sanitize(name)
+	if name != "" {
+		name = filepath.Base(name)
+	}
+	name = mime.BEncoding.Encode("utf-8", name)
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(name)
 }
 
 // generateBoundary creates a random MIME boundary
@@ -90,34 +195,60 @@ func (m *Mail) ToBytes() ([]byte, error) {
 		return nil, errors.New("email body is empty")
 	}
 
-	// from valid
-	if !ValidateEmail(m.From) {
-		return nil, fmt.Errorf("invalid From email address: %s", m.From)
+	from, err := parseAddressList("From", []string{m.From})
+	if err != nil {
+		return nil, err
 	}
-
-	// to valid
-	for _, addr := range m.To {
-		if !ValidateEmail(addr) {
-			return nil, fmt.Errorf("invalid To email address: %s", addr)
+	to, err := parseAddressList("To", m.To)
+	if err != nil {
+		return nil, err
+	}
+	cc, err := parseAddressList("Cc", m.Cc)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := parseAddressList("Bcc", m.Bcc); err != nil {
+		return nil, err
+	}
+	var replyTo string
+	if m.ReplyTo != "" {
+		if replyTo, err = parseAddressList("Reply-To", []string{m.ReplyTo}); err != nil {
+			return nil, err
 		}
 	}
 
-	// cc valid
-	for _, addr := range m.Cc {
-		if !ValidateEmail(addr) {
-			return nil, fmt.Errorf("invalid Cc email address: %s", addr)
+	extra := make(map[string]string, len(m.Headers))
+	for k, v := range m.Headers {
+		key := textproto.CanonicalMIMEHeaderKey(k)
+		if key == "" || strings.ContainsAny(key, ": \t\r\n") {
+			return nil, fmt.Errorf("invalid header name: %q", k)
 		}
+		if reservedHeaders[key] {
+			return nil, fmt.Errorf("header %s is set from Mail fields", key)
+		}
+		extra[key] = mime.BEncoding.Encode("utf-8", v)
+	}
+	if _, ok := extra["Date"]; !ok {
+		extra["Date"] = time.Now().Format(time.RFC1123Z)
+	}
+	if _, ok := extra["Message-Id"]; !ok {
+		extra["Message-Id"] = generateMessageID(m.From)
 	}
 
-	// write headers
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", m.From))
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(m.To, ", ")))
-	if len(m.Cc) > 0 {
-		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", strings.Join(m.Cc, ", ")))
+	// write headers (Bcc is intentionally omitted)
+	writeHeader(msg, "From", from)
+	writeHeader(msg, "To", to)
+	if cc != "" {
+		writeHeader(msg, "Cc", cc)
 	}
-	sbj := mime.QEncoding.Encode("utf-8", m.Subject)
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", sbj))
-	msg.WriteString("MIME-Version: 1.0\r\n")
+	if replyTo != "" {
+		writeHeader(msg, "Reply-To", replyTo)
+	}
+	writeHeader(msg, "Subject", mime.BEncoding.Encode("utf-8", m.Subject))
+	for _, k := range slices.Sorted(maps.Keys(extra)) {
+		writeHeader(msg, k, extra[k])
+	}
+	writeHeader(msg, "MIME-Version", "1.0")
 
 	boundary := generateBoundary()
 	hasAttachments := len(m.Attachment) > 0
@@ -152,18 +283,17 @@ func (m *Mail) ToBytes() ([]byte, error) {
 		for _, file := range m.Inline {
 			msg.WriteString(fmt.Sprintf("\r\n--%s\r\n", relatedBoundary))
 
-			sanitize := strings.NewReplacer("\r", "", "\n", "").Replace
 			contentType := sanitize(file.ContentType)
 			if contentType == "" {
 				contentType = "application/octet-stream"
 			}
-			name := sanitize(file.Name)
+			name := encodeFileName(file.Name)
 			cid := sanitize(file.CID)
 
-			msg.WriteString(fmt.Sprintf("Content-Type: %s; name=\"%s\"\r\n", contentType, name))
-			msg.WriteString("Content-Transfer-Encoding: base64\r\n")
-			msg.WriteString(fmt.Sprintf("Content-ID: <%s>\r\n", cid))
-			msg.WriteString(fmt.Sprintf("Content-Disposition: inline; filename=\"%s\"\r\n", name))
+			writeHeader(msg, "Content-Type", fmt.Sprintf("%s; name=\"%s\"", contentType, name))
+			writeHeader(msg, "Content-Transfer-Encoding", "base64")
+			writeHeader(msg, "Content-ID", "<"+cid+">")
+			writeHeader(msg, "Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", name))
 
 			if err := m.writeBytes(msg, file.Body); err != nil {
 				return nil, err
@@ -188,7 +318,6 @@ func (m *Mail) ToBytes() ([]byte, error) {
 
 	// add attachments
 	if hasAttachments {
-		sanitize := strings.NewReplacer("\r", "", "\n", "").Replace
 		for _, file := range m.Attachment {
 			msg.WriteString(fmt.Sprintf("\r\n--%s\r\n", boundary))
 
@@ -196,10 +325,10 @@ func (m *Mail) ToBytes() ([]byte, error) {
 			if contentType == "" {
 				contentType = "application/octet-stream"
 			}
-			name := sanitize(file.Name)
-			msg.WriteString(fmt.Sprintf("Content-Type: %s; name=\"%s\"\r\n", contentType, name))
-			msg.WriteString("Content-Transfer-Encoding: base64\r\n")
-			msg.WriteString(fmt.Sprintf("Content-Disposition: attachment; filename=\"%s\"\r\n", name))
+			name := encodeFileName(file.Name)
+			writeHeader(msg, "Content-Type", fmt.Sprintf("%s; name=\"%s\"", contentType, name))
+			writeHeader(msg, "Content-Transfer-Encoding", "base64")
+			writeHeader(msg, "Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
 
 			if len(file.Body) > 0 {
 				if err := m.writeBytes(msg, file.Body); err != nil {

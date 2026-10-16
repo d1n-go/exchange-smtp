@@ -3,8 +3,12 @@ package exchangesmtp
 import (
 	"bytes"
 	"encoding/base64"
+	"mime"
+	netmail "net/mail"
+	"net/smtp"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -21,6 +25,10 @@ func TestValidateEmail(t *testing.T) {
 		{"user@", false},
 		{"user @example.com", false},
 		{"", false},
+		{"o'brien@example.com", true},
+		{"admin@exchange", true},
+		{"Ivan <ivan@example.com>", false},
+		{"a@b.com\r\nBcc: evil@example.com", false},
 	}
 
 	for _, tt := range tests {
@@ -386,7 +394,7 @@ func TestMail_ToBytes_InlineEmptyContentType(t *testing.T) {
 func TestLoginAuth_StartAndNext(t *testing.T) {
 	auth := LoginAuth("user@example.com", "secret")
 
-	proto, resp, err := auth.Start(nil)
+	proto, resp, err := auth.Start(&smtp.ServerInfo{Name: "mail.example.com", TLS: true})
 	if err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
@@ -427,5 +435,271 @@ func TestQuickSender_Send(t *testing.T) {
 	err := qs.Send("Subject", "Body")
 	if err == nil {
 		t.Fatal("expected connection error to localhost:25")
+	}
+}
+
+func TestLoginAuth_RefusesWithoutTLS(t *testing.T) {
+	info := &smtp.ServerInfo{Name: "mail.example.com", TLS: false}
+
+	if _, _, err := LoginAuth("u", "p").Start(info); err == nil {
+		t.Error("expected LoginAuth to refuse an unencrypted connection")
+	}
+	if _, _, err := LoginAuth("u", "p").Start(&smtp.ServerInfo{Name: "localhost"}); err != nil {
+		t.Errorf("expected LoginAuth to allow localhost, got %v", err)
+	}
+	if _, _, err := InsecureLoginAuth("u", "p").Start(info); err != nil {
+		t.Errorf("expected InsecureLoginAuth to allow an unencrypted connection, got %v", err)
+	}
+}
+
+func TestMail_ToBytes_LongSubjectFolded(t *testing.T) {
+	subject := strings.Repeat("Отчёт о продажах ", 15)
+	mail := Mail{
+		MT:      PlainText,
+		From:    "sender@example.com",
+		To:      []string{"recipient@example.com"},
+		Subject: subject,
+		Body:    "Body",
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	header, _, _ := strings.Cut(string(msg), "\r\n\r\n")
+	// an encoded-word can't be split, so only the hard 998 limit is strict;
+	// 78 is the target for lines that consist of several words.
+	for _, line := range strings.Split(header, "\r\n") {
+		if len(line) > maxLineLen+len("Subject: ") {
+			t.Errorf("header line is %d chars: %q", len(line), line)
+		}
+	}
+	if !strings.Contains(header, "?=\r\n =?") {
+		t.Errorf("expected subject to be folded between encoded-words, got: %s", header)
+	}
+
+	// unfold and decode the Subject back
+	decoded, err := new(mime.WordDecoder).DecodeHeader(headerValue(msg, "Subject"))
+	if err != nil {
+		t.Fatalf("decode subject: %v", err)
+	}
+	if decoded != subject {
+		t.Errorf("subject round-trip mismatch:\n got %q\nwant %q", decoded, subject)
+	}
+}
+
+func TestMail_ToBytes_SubjectHeaderInjection(t *testing.T) {
+	mail := Mail{
+		MT:      PlainText,
+		From:    "sender@example.com",
+		To:      []string{"recipient@example.com"},
+		Subject: "Hello\r\nBcc: evil@example.com",
+		Body:    "Body",
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if bytes.Contains(msg, []byte("\r\nBcc:")) {
+		t.Errorf("subject header injection not prevented: %s", msg)
+	}
+}
+
+func TestMail_ToBytes_AttachmentFileName(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"report.pdf", `filename="report.pdf"`},
+		{"/var/reports/report.pdf", `filename="report.pdf"`},
+		{`say "hi".txt`, `filename="say \"hi\".txt"`},
+		{"Отчёт.pdf", `filename="=?utf-8?b?` + base64.StdEncoding.EncodeToString([]byte("Отчёт.pdf")) + `?="`},
+	}
+
+	for _, tt := range tests {
+		mail := Mail{
+			MT:         PlainText,
+			From:       "sender@example.com",
+			To:         []string{"recipient@example.com"},
+			Subject:    "Attachment name",
+			Body:       "See attached.",
+			Attachment: []AttachmentFile{{Name: tt.name, Body: []byte("data")}},
+		}
+
+		msg, err := mail.ToBytes()
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", tt.name, err)
+		}
+		if !bytes.Contains(msg, []byte(tt.want)) {
+			t.Errorf("%q: expected %s, got: %s", tt.name, tt.want, msg)
+		}
+	}
+}
+
+func TestMail_ToBytes_AttachmentFileNameRoundTrip(t *testing.T) {
+	name := strings.Repeat("Длинное имя файла ", 5) + ".xlsx"
+	mail := Mail{
+		MT:         PlainText,
+		From:       "sender@example.com",
+		To:         []string{"recipient@example.com"},
+		Subject:    "Attachment name",
+		Body:       "See attached.",
+		Attachment: []AttachmentFile{{Name: name, Body: []byte("data")}},
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// unfold headers and parse the attachment's Content-Disposition
+	unfolded := strings.ReplaceAll(string(msg), "\r\n ", " ")
+	_, rest, ok := strings.Cut(unfolded, "Content-Disposition: ")
+	if !ok {
+		t.Fatalf("no Content-Disposition in: %s", msg)
+	}
+	value, _, _ := strings.Cut(rest, "\r\n")
+	_, params, err := mime.ParseMediaType(value)
+	if err != nil {
+		t.Fatalf("parse %q: %v", value, err)
+	}
+	got, err := new(mime.WordDecoder).DecodeHeader(params["filename"])
+	if err != nil {
+		t.Fatalf("decode filename: %v", err)
+	}
+	if got != name {
+		t.Errorf("filename round-trip mismatch:\n got %q\nwant %q", got, name)
+	}
+}
+
+// headerValue returns the unfolded value of the first top-level header name.
+func headerValue(msg []byte, name string) string {
+	header, _, _ := strings.Cut(string(msg), "\r\n\r\n")
+	unfolded := strings.ReplaceAll(header, "\r\n ", " ")
+	for _, line := range strings.Split(unfolded, "\r\n") {
+		if v, ok := strings.CutPrefix(line, name+": "); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+func TestMail_ToBytes_DateAndMessageID(t *testing.T) {
+	mail := Mail{
+		MT:      PlainText,
+		From:    "sender@example.com",
+		To:      []string{"recipient@example.com"},
+		Subject: "Headers",
+		Body:    "Body",
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := netmail.ParseDate(headerValue(msg, "Date")); err != nil {
+		t.Errorf("invalid Date header: %v", err)
+	}
+	if id := headerValue(msg, "Message-Id"); !strings.HasPrefix(id, "<") || !strings.HasSuffix(id, "@example.com>") {
+		t.Errorf("unexpected Message-Id: %q", id)
+	}
+}
+
+func TestMail_ToBytes_DisplayNames(t *testing.T) {
+	mail := Mail{
+		MT:      PlainText,
+		From:    "Иван Петров <ivan@example.com>",
+		To:      []string{"Support <support@example.com>", "plain@example.com"},
+		ReplyTo: "noreply@example.com",
+		Subject: "Names",
+		Body:    "Body",
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	from, err := netmail.ParseAddress(headerValue(msg, "From"))
+	if err != nil || from.Name != "Иван Петров" || from.Address != "ivan@example.com" {
+		t.Errorf("From round-trip: got %+v, err %v", from, err)
+	}
+	if got := headerValue(msg, "To"); got != `"Support" <support@example.com>, plain@example.com` {
+		t.Errorf("unexpected To: %q", got)
+	}
+	if got := headerValue(msg, "Reply-To"); got != "noreply@example.com" {
+		t.Errorf("unexpected Reply-To: %q", got)
+	}
+}
+
+func TestMail_Bcc(t *testing.T) {
+	mail := Mail{
+		MT:      PlainText,
+		From:    "sender@example.com",
+		To:      []string{"Recipient <to@example.com>"},
+		Cc:      []string{"cc@example.com"},
+		Bcc:     []string{"hidden@example.com"},
+		Subject: "Bcc",
+		Body:    "Body",
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if bytes.Contains(msg, []byte("hidden@example.com")) {
+		t.Errorf("Bcc address must not appear in the message: %s", msg)
+	}
+
+	want := []string{"to@example.com", "cc@example.com", "hidden@example.com"}
+	if got := mail.AllRecipients(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("AllRecipients() = %v, want %v", got, want)
+	}
+
+	mail.Bcc = []string{"not-an-address"}
+	if _, err := mail.ToBytes(); err == nil || !strings.Contains(err.Error(), "invalid Bcc email") {
+		t.Errorf("expected invalid Bcc error, got %v", err)
+	}
+}
+
+func TestMail_ToBytes_CustomHeaders(t *testing.T) {
+	mail := Mail{
+		MT:      PlainText,
+		From:    "sender@example.com",
+		To:      []string{"recipient@example.com"},
+		Subject: "Headers",
+		Body:    "Body",
+		Headers: map[string]string{
+			"importance": "High",
+			"X-Note":     "evil\r\nBcc: x@example.com",
+			"Message-ID": "<fixed@example.com>",
+		},
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := headerValue(msg, "Importance"); got != "High" {
+		t.Errorf("unexpected Importance: %q", got)
+	}
+	if got := headerValue(msg, "Message-Id"); got != "<fixed@example.com>" {
+		t.Errorf("Message-ID override ignored: %q", got)
+	}
+	if bytes.Contains(msg, []byte("\r\nBcc:")) {
+		t.Errorf("header value injection not prevented: %s", msg)
+	}
+
+	for _, bad := range []map[string]string{
+		{"Subject": "override"},
+		{"Bad Name": "x"},
+		{"X-Evil\r\nBcc": "x"},
+	} {
+		mail.Headers = bad
+		if _, err := mail.ToBytes(); err == nil {
+			t.Errorf("expected error for headers %q", bad)
+		}
 	}
 }
