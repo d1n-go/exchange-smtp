@@ -338,3 +338,15 @@ func TestMailSender_ContextCancel(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestQuickSender_Options(t *testing.T) {
+	cert, _ := selfSignedCert(t)
+	srv := newFakeServer(t, cert)
+	srv.startTLS = true
+	srv.serve(t)
+
+	qs := NewQuickSender("user", "pass", srv.addr(), "from@example.com", []string{"to@example.com"}, WithInsecureSkipVerify())
+	if err := qs.Send("Subject", "Body"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
