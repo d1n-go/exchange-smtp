@@ -19,10 +19,11 @@ type MailSender struct {
 	auth   smtp.Auth
 	server string
 
-	tlsConfig   *tls.Config
-	helloName   string
-	timeout     time.Duration
-	implicitTLS bool
+	tlsConfig         *tls.Config
+	helloName         string
+	timeout           time.Duration
+	implicitTLS       bool
+	allowInsecureAuth bool
 }
 
 // Option configures a MailSender.
@@ -72,16 +73,28 @@ func WithImplicitTLS() Option {
 	}
 }
 
+// WithAllowInsecureAuth allows sending credentials when the server offers no
+// TLS (no STARTTLS and no implicit TLS). Use it only inside a trusted network.
+func WithAllowInsecureAuth() Option {
+	return func(ms *MailSender) {
+		ms.allowInsecureAuth = true
+	}
+}
+
 // NewMailSender is constructor for MailSender.
 // server is "host:port", e.g. "mail.company.local:587".
 func NewMailSender(username, password, server string, opts ...Option) *MailSender {
 	ms := &MailSender{
-		auth:    LoginAuth(username, password),
 		server:  server,
 		timeout: DefaultTimeout,
 	}
 	for _, opt := range opts {
 		opt(ms)
+	}
+	if ms.allowInsecureAuth {
+		ms.auth = InsecureLoginAuth(username, password)
+	} else {
+		ms.auth = LoginAuth(username, password)
 	}
 	return ms
 }

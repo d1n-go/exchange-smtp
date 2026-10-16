@@ -3,6 +3,7 @@ package exchangesmtp
 import (
 	"bytes"
 	"encoding/base64"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"testing"
@@ -386,7 +387,7 @@ func TestMail_ToBytes_InlineEmptyContentType(t *testing.T) {
 func TestLoginAuth_StartAndNext(t *testing.T) {
 	auth := LoginAuth("user@example.com", "secret")
 
-	proto, resp, err := auth.Start(nil)
+	proto, resp, err := auth.Start(&smtp.ServerInfo{Name: "mail.example.com", TLS: true})
 	if err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
@@ -427,5 +428,19 @@ func TestQuickSender_Send(t *testing.T) {
 	err := qs.Send("Subject", "Body")
 	if err == nil {
 		t.Fatal("expected connection error to localhost:25")
+	}
+}
+
+func TestLoginAuth_RefusesWithoutTLS(t *testing.T) {
+	info := &smtp.ServerInfo{Name: "mail.example.com", TLS: false}
+
+	if _, _, err := LoginAuth("u", "p").Start(info); err == nil {
+		t.Error("expected LoginAuth to refuse an unencrypted connection")
+	}
+	if _, _, err := LoginAuth("u", "p").Start(&smtp.ServerInfo{Name: "localhost"}); err != nil {
+		t.Errorf("expected LoginAuth to allow localhost, got %v", err)
+	}
+	if _, _, err := InsecureLoginAuth("u", "p").Start(info); err != nil {
+		t.Errorf("expected InsecureLoginAuth to allow an unencrypted connection, got %v", err)
 	}
 }
