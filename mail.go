@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"mime"
 	"mime/quotedprintable"
+	"net/mail"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
@@ -32,11 +32,13 @@ func (mt MailType) String() string {
 
 const charset = "UTF-8"
 
-var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
-
-// ValidateEmail email-address is valid
+// ValidateEmail reports whether email is a bare RFC 5322 address
+// ("user@example.com", without a display name).
+// Single-label domains ("admin@exchange") common in internal AD networks
+// are accepted.
 func ValidateEmail(email string) bool {
-	return emailRegex.MatchString(email)
+	a, err := mail.ParseAddress(email)
+	return err == nil && a.Address == email
 }
 
 // Mail is a struct for two types of email: plain text and html like.

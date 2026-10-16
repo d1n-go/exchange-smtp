@@ -24,6 +24,10 @@ func TestValidateEmail(t *testing.T) {
 		{"user@", false},
 		{"user @example.com", false},
 		{"", false},
+		{"o'brien@example.com", true},
+		{"admin@exchange", true},
+		{"Ivan <ivan@example.com>", false},
+		{"a@b.com\r\nBcc: evil@example.com", false},
 	}
 
 	for _, tt := range tests {
