@@ -13,8 +13,10 @@ No external dependencies — stdlib only.
 ## Install
 
 ```bash
-go get github.com/demen1n/exchange-smtp
+go get github.com/d1n-go/exchange-smtp
 ```
+
+The module moved from `github.com/demen1n/exchange-smtp` (versions up to v1.2.0 stay available there). To migrate, replace the import path; the API is unchanged.
 
 ## Usage
 
