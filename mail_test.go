@@ -3,9 +3,11 @@ package exchangesmtp
 import (
 	"bytes"
 	"encoding/base64"
+	"mime"
 	"net/smtp"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -442,5 +444,63 @@ func TestLoginAuth_RefusesWithoutTLS(t *testing.T) {
 	}
 	if _, _, err := InsecureLoginAuth("u", "p").Start(info); err != nil {
 		t.Errorf("expected InsecureLoginAuth to allow an unencrypted connection, got %v", err)
+	}
+}
+
+func TestMail_ToBytes_LongSubjectFolded(t *testing.T) {
+	subject := strings.Repeat("Отчёт о продажах ", 15)
+	mail := Mail{
+		MT:      PlainText,
+		From:    "sender@example.com",
+		To:      []string{"recipient@example.com"},
+		Subject: subject,
+		Body:    "Body",
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	header, _, _ := strings.Cut(string(msg), "\r\n\r\n")
+	// an encoded-word can't be split, so only the hard 998 limit is strict;
+	// 78 is the target for lines that consist of several words.
+	for _, line := range strings.Split(header, "\r\n") {
+		if len(line) > maxLineLen+len("Subject: ") {
+			t.Errorf("header line is %d chars: %q", len(line), line)
+		}
+	}
+	if !strings.Contains(header, "?=\r\n =?") {
+		t.Errorf("expected subject to be folded between encoded-words, got: %s", header)
+	}
+
+	// unfold and decode the Subject back
+	start := strings.Index(header, "Subject: ") + len("Subject: ")
+	end := strings.Index(header[start:], "\r\nMIME-Version")
+	unfolded := strings.ReplaceAll(header[start:start+end], "\r\n", "")
+	decoded, err := new(mime.WordDecoder).DecodeHeader(unfolded)
+	if err != nil {
+		t.Fatalf("decode subject: %v", err)
+	}
+	if decoded != subject {
+		t.Errorf("subject round-trip mismatch:\n got %q\nwant %q", decoded, subject)
+	}
+}
+
+func TestMail_ToBytes_SubjectHeaderInjection(t *testing.T) {
+	mail := Mail{
+		MT:      PlainText,
+		From:    "sender@example.com",
+		To:      []string{"recipient@example.com"},
+		Subject: "Hello\r\nBcc: evil@example.com",
+		Body:    "Body",
+	}
+
+	msg, err := mail.ToBytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if bytes.Contains(msg, []byte("\r\nBcc:")) {
+		t.Errorf("subject header injection not prevented: %s", msg)
 	}
 }

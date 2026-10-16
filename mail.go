@@ -72,6 +72,31 @@ func (m *Mail) AllRecipients() []string {
 	return r
 }
 
+// maxLineLen is the recommended header line length (RFC 5322 2.1.1).
+const maxLineLen = 78
+
+// writeHeader writes "Name: value" and folds value at spaces so that lines
+// stay within maxLineLen where possible. Exchange truncates or rejects header
+// lines longer than 998 characters, which a long encoded subject easily hits.
+func writeHeader(msg *bytes.Buffer, name, value string) {
+	msg.WriteString(name)
+	msg.WriteString(": ")
+	lineLen := len(name) + 2
+	for i, word := range strings.Split(value, " ") {
+		if i > 0 {
+			if lineLen+1+len(word) > maxLineLen {
+				msg.WriteString("\r\n")
+				lineLen = 0
+			}
+			msg.WriteByte(' ')
+			lineLen++
+		}
+		msg.WriteString(word)
+		lineLen += len(word)
+	}
+	msg.WriteString("\r\n")
+}
+
 // generateBoundary creates a random MIME boundary
 func generateBoundary() string {
 	var buf [16]byte
@@ -110,14 +135,13 @@ func (m *Mail) ToBytes() ([]byte, error) {
 	}
 
 	// write headers
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", m.From))
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(m.To, ", ")))
+	writeHeader(msg, "From", m.From)
+	writeHeader(msg, "To", strings.Join(m.To, ", "))
 	if len(m.Cc) > 0 {
-		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", strings.Join(m.Cc, ", ")))
+		writeHeader(msg, "Cc", strings.Join(m.Cc, ", "))
 	}
-	sbj := mime.QEncoding.Encode("utf-8", m.Subject)
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", sbj))
-	msg.WriteString("MIME-Version: 1.0\r\n")
+	writeHeader(msg, "Subject", mime.BEncoding.Encode("utf-8", m.Subject))
+	writeHeader(msg, "MIME-Version", "1.0")
 
 	boundary := generateBoundary()
 	hasAttachments := len(m.Attachment) > 0
