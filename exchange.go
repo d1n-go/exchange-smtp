@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/smtp"
+	"os"
 	"time"
 )
 
@@ -111,9 +112,21 @@ func (ms *MailSender) SendContext(ctx context.Context, mail Mail) error {
 		return err
 	}
 
+	if ms.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, ms.timeout)
+		defer cancel()
+	}
+
 	err = ms.send(ctx, bareAddress(mail.From), mail.AllRecipients(), b)
-	if err != nil && ctx.Err() != nil {
-		return ctx.Err()
+	if err != nil {
+		// report timeouts and cancellation as context errors
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("%w: %v", ctxErr, err)
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return fmt.Errorf("%w: %v", context.DeadlineExceeded, err)
+		}
 	}
 	return err
 }
@@ -122,12 +135,6 @@ func (ms *MailSender) send(ctx context.Context, from string, to []string, msg []
 	host, _, err := net.SplitHostPort(ms.server)
 	if err != nil {
 		return fmt.Errorf("invalid server address %q: %w", ms.server, err)
-	}
-
-	if ms.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, ms.timeout)
-		defer cancel()
 	}
 
 	var d net.Dialer
